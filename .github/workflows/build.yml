@@ -1066,7 +1066,10 @@ jobs:
           # Exception: Full LTO requires ld.lld (GNU ld can't handle LTO bitcode).
 
           # === LTO + Polly flags ===
-          EXTRA_KCFLAGS=""
+          # Baseline: silence -Werror promotions from newer Clang on this old
+          # downstream tree (e.g. qcacld-3.0 ce_main.c implicit-enum-enum-cast).
+          # The Bouquet ROM builds with a Clang that doesn't error on these.
+          EXTRA_KCFLAGS="-Wno-error"
           LINKER_OVERRIDE=""
           LTO_MODE="${{ inputs.enable_lto }}"
           POLLY_ENABLED="${{ inputs.enable_polly }}"
