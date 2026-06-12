@@ -866,8 +866,11 @@ jobs:
             } >> "${DCFG_PATH}"
             echo "Using KPROBES hooks"
           else
-            echo "CONFIG_KSU_MANUAL_HOOK=y" >> "${DCFG_PATH}"
-            echo "Using MANUAL hooks (mode: ${KSU_HOOK_MODE})"
+            {
+              echo "CONFIG_KSU_MANUAL_HOOK=y"
+              echo "# CONFIG_KSU_KPROBES_HOOK is not set"
+            } >> "${DCFG_PATH}"
+            echo "Using MANUAL hooks (mode: ${KSU_HOOK_MODE}) - KSU_MANUAL_HOOK=y, KPROBES_HOOK disabled"
           fi
 
           if [ "${{ inputs.enable_susfs }}" = "true" ]; then
