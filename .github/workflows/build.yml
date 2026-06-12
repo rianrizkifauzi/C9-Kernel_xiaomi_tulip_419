@@ -19,6 +19,10 @@ on:
         description: 'Defconfig name (under arch/arm64/configs/). vendor/bouquet_defconfig = tulip/whyred unified Bouquet A15.'
         required: true
         default: 'vendor/bouquet_defconfig'
+      defconfig_fragment:
+        description: 'Device fragment config merged on top (Bouquet build.sh style FG_DEFCON, e.g. vendor/tulip.config). Empty = none.'
+        required: false
+        default: 'vendor/tulip.config'
       ksun_repo:
         description: 'KernelSU implementation (KernelSU-Next/KernelSU-Next = upstream | ThRE-Team/KernelSU-Next = ThRE fork)'
         required: true
@@ -1035,6 +1039,22 @@ jobs:
           fi
           echo "=== Generating .config from ${MAKE_DCFG} ==="
           make O=out ARCH=arm64 "${MAKE_DCFG}" 2>&1 | tee -a build.log
+
+          # Merge device fragment config (Bouquet build.sh FG_DEFCON style).
+          # Without this, building vendor/bouquet_defconfig alone compiles ALL
+          # board DTBs (incl. qrd needing missing sdm630-qrd.dtsi) and unrelated
+          # drivers (smb-lib MAX_PLUSE_COUNT_ALLOWED). The fragment sets
+          # CONFIG_XIAOMI_TULIP=y which scopes the build to tulip.
+          FRAG="${{ inputs.defconfig_fragment }}"
+          if [ -n "$FRAG" ] && [ -f "arch/arm64/configs/${FRAG}" ]; then
+            echo "=== Merging device fragment: ${FRAG} ==="
+            ./scripts/kconfig/merge_config.sh -m -O out out/.config "arch/arm64/configs/${FRAG}" 2>&1 | tee -a build.log
+            make O=out ARCH=arm64 olddefconfig 2>&1 | tee -a build.log
+            echo "  Verify fragment applied:"
+            grep -E "CONFIG_XIAOMI_TULIP|CONFIG_XIAOMI_WHYRED" out/.config || echo "  (no device gate found)"
+          else
+            echo "::warning::Fragment ${FRAG} not found or empty - building full defconfig (may fail on qrd/smb-lib)"
+          fi
 
           echo ""
           echo "=== Building kernel (Clang+GNU-LD hybrid for 4.4 compat) ==="
