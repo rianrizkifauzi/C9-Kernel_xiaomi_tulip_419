@@ -1,0 +1,1292 @@
+name: Build C9 Kernel KSUN (Tulip 4.19 A15 Dynamic)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: 'Kernel source repo (owner/name)'
+        required: true
+        default: 'Bouquet-Dynamic-Development/kernel_nope_sdm660'
+      kernel_branch:
+        description: 'Kernel source branch (staging-mlgru = Bouquet DuckG kernel for A15 dynamic ROM)'
+        required: true
+        default: 'staging-mlgru'
+      kernel_commit:
+        description: 'Pin kernel source to specific commit SHA (use "head" for latest).'
+        required: true
+        default: 'head'
+      defconfig:
+        description: 'Defconfig name (under arch/arm64/configs/). vendor/bouquet_defconfig = tulip/whyred unified Bouquet A15.'
+        required: true
+        default: 'vendor/bouquet_defconfig'
+      ksun_repo:
+        description: 'KernelSU implementation (KernelSU-Next/KernelSU-Next = upstream | ThRE-Team/KernelSU-Next = ThRE fork)'
+        required: true
+        default: 'KernelSU-Next/KernelSU-Next'
+      ksun_branch:
+        description: 'KernelSU tag/branch. legacy = stable 3.x for non-GKI 4.x kernel.'
+        required: true
+        default: 'legacy'
+      ksun_commit:
+        description: 'Pin KSU to specific commit SHA (use "head" for branch head).'
+        required: true
+        default: 'head'
+      susfs_branch:
+        description: 'SUSFS branch'
+        required: true
+        default: 'kernel-4.19'
+      enable_susfs:
+        description: 'Apply SUSFS patches'
+        required: true
+        default: 'false'
+        type: choice
+        options: ['true', 'false']
+      hook_strategy:
+        description: 'Hook strategy: none (RECOMMENDED if kernel pre-patched like kucingoranye branch) | kucingoranye_patch (apply patch) | minimal | full'
+        required: true
+        default: 'none'
+        type: choice
+        options: ['kucingoranye_patch', 'minimal', 'full', 'none']
+      pre_patched_kernel:
+        description: 'Skip cloning KernelSU + skip applying patches if true. FALSE for Bouquet source (clean, needs KSU clone + hook inject).'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['true', 'false']
+      use_llvm_linker:
+        description: 'Use LLD (LLVM linker) instead of GNU ld. Required for modern 4.19+ kernels with kucingoranye-style Makefile (vdso uses -m llvm).'
+        required: false
+        default: 'true'
+        type: choice
+        options: ['true', 'false']
+      legacy_fstab:
+        description: 'Patch lavender DTS to non-dynamic (legacy) fstab. Set true if device uses direct system/vendor partition (no super/dynamic). Fixes init "partition super not found".'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['true', 'false']
+      hook_patch_file:
+        description: 'kucingoranye patch file (kernel-4.19_5.4.patch for 4.19/5.4, kernel-4.4_4.9.patch for 4.4/4.9, kernel-4.14.patch for 4.14)'
+        required: false
+        default: 'kernel-4.19_5.4.patch'
+        type: choice
+        options: ['kernel-4.19_5.4.patch', 'kernel-4.4_4.9.patch', 'kernel-4.14.patch']
+      skip_sig_fix:
+        description: 'Skip 3-arg signature fix on ksu-patches branch (set true if branch already synced with rsuntk modern)'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['true', 'false']
+      kernel_codename:
+        description: 'Kernel codename (San-Kernel style branding, e.g. Phoenix, Sentinel, Aether)'
+        required: false
+        default: 'BKZ'
+      kernel_relver:
+        description: 'Kernel release version (San-Kernel style, e.g. R1.0, R1.1.101)'
+        required: false
+        default: 'R1.0'
+      enable_lto:
+        description: 'LTO mode (off=no LTO, thin=ThinLTO parallel, full=Full LTO max optimize). WARNING: full LTO needs 16GB+ RAM and 2-3x build time.'
+        required: false
+        default: 'off'
+        type: choice
+        options: ['off', 'thin', 'full']
+      enable_polly:
+        description: 'Enable LLVM Polly loop optimizer (polyhedral optimization). Experimental on 4.19.'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['true', 'false']
+      use_stock_dtb:
+        description: 'Stitch STOCK S0NiX dtb into Image.gz-dtb. true = foreign-lineage source (kucingoranye, dtb mismatch). false = ImSpiDy/S0NiX source (native dtb matches ROM).'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['true', 'false']
+      patch_dtb_encrypt:
+        description: 'Patch stock DTB to disable forced encryption (forceencrypt->encryptable). Fixes init_user0_failed bootloop when kernel cannot derive FBE key. Requires use_stock_dtb=true.'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['true', 'false']
+      patch_dtb_wled:
+        description: 'Fix backlight: retarget WLED node compatible qcom,qpnp-wled -> qcom,pm660l-spmi-wled so the in-tree mainline WLED driver binds. Fixes stuck-bright/non-functional brightness slider. Requires use_stock_dtb=true.'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['true', 'false']
+      force_ksu_version:
+        description: 'Force KSU_VERSION on pre-patched source to match manager (e.g. 33129). Empty = leave source default. Fixes "version too low for manager" warning.'
+        required: false
+        default: ''
+
+env:
+  TZ: Asia/Jakarta
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout builder repo
+        uses: actions/checkout@v4
+        with:
+          path: builder
+
+      - name: Validate inputs (pre-flight check)
+        run: |
+          set -e
+          echo "Checking kernel source repo accessibility..."
+          if ! git ls-remote --exit-code --heads \
+              "https://github.com/${{ inputs.kernel_repo }}.git" \
+              "${{ inputs.kernel_branch }}" >/dev/null 2>&1; then
+            echo "::error::Repo or branch not accessible: https://github.com/${{ inputs.kernel_repo }} @ ${{ inputs.kernel_branch }}"
+            echo ""
+            echo "Try one of these working sources for lavender (4.19):"
+            echo "  - ImSpiDy/kernel_xiaomi_lavender @ R1 (S0NiX 4.19.304)"
+            echo "  - ImSpiDy/kernel_xiaomi_lavender @ 14-Retro (S0NiX 4.19.315)"
+            echo "  - stormbreaker-project/kernel_xiaomi_lavender_4.19 @ <branches>"
+            echo "  - greenforce-project/android-kernel-xiaomi-lavender @ <branches>"
+            exit 1
+          fi
+          echo "OK: kernel source reachable."
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ca-certificates ccache cpio \
+            curl flex git kmod libelf-dev libssl-dev lz4 \
+            make python3 rsync wget xz-utils zip zstd \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            libncurses-dev device-tree-compiler
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: tulip419-${{ inputs.kernel_repo }}-${{ inputs.kernel_branch }}
+          max-size: 2G
+
+      - name: Clone kernel source
+        run: |
+          set -e
+          KCOMMIT="${{ inputs.kernel_commit }}"
+          if [ -z "$KCOMMIT" ] || [ "$KCOMMIT" = "head" ] || [ "$KCOMMIT" = "HEAD" ]; then
+            echo "=== Shallow clone (head only) ==="
+            git clone --depth=1 -b "${{ inputs.kernel_branch }}" \
+              "https://github.com/${{ inputs.kernel_repo }}.git" kernel_source
+          else
+            echo "=== Shallow clone with target commit fetch: $KCOMMIT ==="
+            git clone --depth=1 -b "${{ inputs.kernel_branch }}" \
+              "https://github.com/${{ inputs.kernel_repo }}.git" kernel_source
+            cd kernel_source
+            # Fetch the specific commit shallowly
+            git fetch --depth=1 origin "$KCOMMIT" || {
+              echo "Direct fetch failed, expanding depth..."
+              git fetch --depth=200 origin "${{ inputs.kernel_branch }}" 2>/dev/null || \
+                git fetch --unshallow origin "${{ inputs.kernel_branch }}"
+            }
+            git checkout "$KCOMMIT" || {
+              echo "::error::Failed to checkout commit $KCOMMIT"
+              git log --oneline -10
+              exit 1
+            }
+            cd ..
+          fi
+
+          cd kernel_source
+          KERNEL_VERSION=$(make kernelversion 2>/dev/null | tail -1 | tr -d '[:space:]' || echo unknown)
+          echo "KERNEL_VERSION=${KERNEL_VERSION}" >> $GITHUB_ENV
+          echo "KERNEL_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          echo "KERNEL_FULL_SHA=$(git rev-parse HEAD)" >> $GITHUB_ENV
+          echo "Final kernel HEAD: $(git rev-parse --short HEAD), version: ${KERNEL_VERSION}"
+
+      - name: Resolve defconfig
+        working-directory: kernel_source
+        run: |
+          set -e
+          INPUT_DCFG="${{ inputs.defconfig }}"
+          CONFIG_DIR="arch/arm64/configs"
+
+          echo "Available defconfigs:"
+          ls -1 "${CONFIG_DIR}" 2>/dev/null || true
+          echo ""
+          # Some sources nest configs under vendor/
+          if [ -d "${CONFIG_DIR}/vendor" ]; then
+            echo "(vendor/ subdir):"
+            ls -1 "${CONFIG_DIR}/vendor"
+            echo ""
+          fi
+
+          if [ "$INPUT_DCFG" = "auto" ] || [ -z "$INPUT_DCFG" ]; then
+            # Try to autodetect a lavender defconfig
+            CANDIDATES="lavender_defconfig lavender-perf_defconfig sdm660_defconfig sdm660-perf_defconfig"
+            FOUND=""
+            for c in $CANDIDATES; do
+              if [ -f "${CONFIG_DIR}/${c}" ]; then FOUND="$c"; break; fi
+              if [ -f "${CONFIG_DIR}/vendor/${c}" ]; then FOUND="vendor/${c}"; break; fi
+            done
+            if [ -z "$FOUND" ]; then
+              echo "::error::Could not autodetect defconfig. List above shows what's available. Re-run with explicit defconfig name."
+              exit 1
+            fi
+            DCFG_PATH="${CONFIG_DIR}/${FOUND}"
+            DCFG_NAME="$FOUND"
+          else
+            if [ -f "${CONFIG_DIR}/${INPUT_DCFG}" ]; then
+              DCFG_PATH="${CONFIG_DIR}/${INPUT_DCFG}"
+              DCFG_NAME="${INPUT_DCFG}"
+            elif [ -f "${CONFIG_DIR}/vendor/${INPUT_DCFG}" ]; then
+              DCFG_PATH="${CONFIG_DIR}/vendor/${INPUT_DCFG}"
+              DCFG_NAME="vendor/${INPUT_DCFG}"
+            else
+              echo "::error::Defconfig not found: ${INPUT_DCFG}"
+              exit 1
+            fi
+          fi
+
+          echo "Using defconfig: ${DCFG_NAME}"
+          echo "DCFG_PATH=${DCFG_PATH}" >> $GITHUB_ENV
+          echo "DCFG_NAME=${DCFG_NAME}" >> $GITHUB_ENV
+          # Derive device codename from defconfig (e.g. lavender_defconfig -> lavender)
+          DEVICE_CODENAME=$(basename "${DCFG_NAME}" | sed 's|_defconfig$||; s|-perf_defconfig$||; s|-perf$||; s|^vendor/||')
+          echo "Device codename: ${DEVICE_CODENAME}"
+          echo "DEVICE_CODENAME=${DEVICE_CODENAME}" >> $GITHUB_ENV
+
+      - name: Clone toolchain (Neutron Clang, fallback Proton)
+        run: |
+          set -e
+          mkdir -p toolchain/clang
+          echo "=== Try Neutron Clang (matches S0NiX stock build env) ==="
+          if cd toolchain/clang && \
+             curl -sSL "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman" -o antman && \
+             chmod +x antman && \
+             ./antman -S 2>&1; then
+            ./antman --patch=glibc 2>&1 || true
+            echo "TOOLCHAIN=neutron" >> $GITHUB_ENV
+            cd "$GITHUB_WORKSPACE"
+          else
+            echo "::warning::Neutron install failed, falling back to Proton Clang"
+            cd "$GITHUB_WORKSPACE"
+            rm -rf toolchain/clang
+            git clone --depth=1 https://github.com/kdrag0n/proton-clang.git toolchain/clang
+            echo "TOOLCHAIN=proton" >> $GITHUB_ENV
+          fi
+          echo "=== Verify ==="
+          ls toolchain/clang/bin/ | head -10
+          toolchain/clang/bin/clang --version
+
+      - name: Clone KernelSU
+        if: ${{ inputs.pre_patched_kernel != 'true' }}
+        working-directory: kernel_source
+        run: |
+          set -e
+          KSU_REPO="${{ inputs.ksun_repo }}"
+          KSU_BRANCH="${{ inputs.ksun_branch }}"
+          echo "Setting up KernelSU from ${KSU_REPO}@${KSU_BRANCH}"
+
+          curl -LSs "https://raw.githubusercontent.com/${KSU_REPO}/${KSU_BRANCH}/kernel/setup.sh" \
+            | bash -s "${KSU_BRANCH}"
+
+          # Determine which directory was created (rsuntk uses "KernelSU", KSUN uses "KernelSU-Next")
+          if [ -d KernelSU ]; then
+            KSU_DIR="KernelSU"
+          elif [ -d KernelSU-Next ]; then
+            KSU_DIR="KernelSU-Next"
+          else
+            echo "::error::KernelSU directory not found after setup"
+            exit 1
+          fi
+
+          cd "${KSU_DIR}"
+          KSUN_VER=$(git describe --tags --abbrev=0 2>/dev/null || git rev-parse --short HEAD)
+          echo "KSUN_VERSION=${KSUN_VER}" >> $GITHUB_ENV
+          echo "KSU_DIR=${KSU_DIR}" >> $GITHUB_ENV
+          echo "KernelSU directory: ${KSU_DIR}, version: ${KSUN_VER}"
+
+      - name: Detect KSU hooks integration mode
+        if: ${{ inputs.pre_patched_kernel != 'true' }}
+        working-directory: kernel_source
+        run: |
+          set -e
+          # Check if kernel source already has KSU manual hook calls (e.g. ksu-patches branch)
+          if grep -rq "ksu_handle_execveat\|ksu_handle_faccessat\|ksu_handle_stat" fs/ 2>/dev/null; then
+            echo "✅ Manual KSU hooks already exist in kernel source"
+            echo "KSU_HOOK_MODE=manual_existing" >> $GITHUB_ENV
+          else
+            echo "⚙️  Clean kernel source - will inject MINIMAL hooks (only execveat)"
+            echo "KSU_HOOK_MODE=minimal_inject" >> $GITHUB_ENV
+          fi
+
+      - name: Fix existing hook signatures (ksu-patches branch only)
+        if: ${{ env.KSU_HOOK_MODE == 'manual_existing' && inputs.skip_sig_fix != 'true' }}
+        working-directory: kernel_source
+        run: |
+          set -e
+          echo "=== Fixing hook signature mismatch (rsuntk expects 3-arg ksu_handle_stat) ==="
+          if grep -q "ksu_handle_stat(&dfd, &filename);" fs/stat.c; then
+            sed -i 's|extern int ksu_handle_stat(int \*dfd, const char __user \*\*filename_user);|extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);|' fs/stat.c
+            sed -i 's|ksu_handle_stat(&dfd, &filename);|ksu_handle_stat(\&dfd, \&filename, NULL);|' fs/stat.c
+            echo "  ✅ fs/stat.c patched to 3-arg signature"
+          fi
+
+      - name: Apply kucingoranye/kernel_patches (manual_hook + path_umount backport)
+        if: ${{ inputs.hook_strategy == 'kucingoranye_patch' && inputs.pre_patched_kernel != 'true' }}
+        working-directory: kernel_source
+        run: |
+          set -e
+          echo "=== Strategy: apply kucingoranye/kernel_patches ==="
+          echo "Source: https://github.com/kucingoranye/kernel_patches"
+          echo ""
+
+          BASE_URL="https://raw.githubusercontent.com/kucingoranye/kernel_patches/main"
+          HOOK_PATCH_FILE="${{ inputs.hook_patch_file }}"
+          HOOK_PATCH_FILE="${HOOK_PATCH_FILE:-kernel-4.19_5.4.patch}"
+          HOOK_PATCH_URL="${BASE_URL}/manual_hook-rksu-ksun/${HOOK_PATCH_FILE}"
+          echo "Using hook patch: ${HOOK_PATCH_FILE}"
+          UMOUNT_PATCH_URL="${BASE_URL}/path_umount/backport-path_umount.patch"
+
+          # Download patches
+          curl -sSL "$HOOK_PATCH_URL" -o /tmp/manual-hook.patch
+          curl -sSL "$UMOUNT_PATCH_URL" -o /tmp/path_umount.patch
+
+          echo "manual-hook.patch:"
+          ls -la /tmp/manual-hook.patch
+          head -5 /tmp/manual-hook.patch
+          echo ""
+          echo "path_umount.patch:"
+          ls -la /tmp/path_umount.patch
+          head -5 /tmp/path_umount.patch
+          echo ""
+
+          # Apply hook patch
+          echo "=== Apply manual hook patch ==="
+          if patch -p1 --forward --fuzz=3 --no-backup-if-mismatch < /tmp/manual-hook.patch; then
+            echo "✅ Manual hook patch applied cleanly"
+          else
+            echo "::warning::Manual hook patch had rejects:"
+            REJECTS=$(find . -name "*.rej" 2>/dev/null)
+            for f in $REJECTS; do
+              echo "--- $f ---"
+              cat "$f"
+              echo ""
+            done
+
+            # Critical files: exec.c, stat.c, open.c, read_write.c, reboot.c, selinux/hooks.c
+            # Non-critical: drivers/input/input.c (volume-key safe-mode trigger only)
+            CRITICAL_REJECT=0
+            for crit in "fs/exec.c.rej" "fs/stat.c.rej" "fs/open.c.rej" "fs/read_write.c.rej" "kernel/reboot.c.rej" "security/selinux/hooks.c.rej"; do
+              if echo "$REJECTS" | grep -q "$crit"; then
+                echo "::error::CRITICAL reject: $crit"
+                CRITICAL_REJECT=1
+              fi
+            done
+
+            if [ "$CRITICAL_REJECT" -eq 1 ]; then
+              echo "::error::Cannot proceed with critical rejects"
+              exit 1
+            fi
+
+            echo "::warning::Only non-critical input.c reject — proceeding without input hook"
+            echo "Note: ksu_input_hook (volume-key safe-mode trigger) will NOT work on this build"
+            # clean rejects to keep tree tidy
+            find . -name "*.rej" -delete 2>/dev/null
+            find . -name "*.orig" -delete 2>/dev/null
+          fi
+          echo ""
+
+          # Apply path_umount backport
+          echo "=== Apply path_umount backport ==="
+          if patch -p1 --forward --fuzz=3 --no-backup-if-mismatch < /tmp/path_umount.patch; then
+            echo "✅ path_umount backport applied"
+          else
+            echo "::warning::path_umount backport had rejects (might already be in tree):"
+            find . -name "*.rej" 2>/dev/null | head -5
+            # Don't exit - Kbuild has fallback inject for this
+          fi
+
+          echo ""
+          echo "=== Verify hooks landed ==="
+          for f in fs/exec.c fs/stat.c fs/open.c fs/read_write.c kernel/reboot.c drivers/input/input.c security/selinux/hooks.c; do
+            if [ -f "$f" ]; then
+              n=$(grep -c "ksu_handle_\|is_ksu_transition\|CONFIG_KSU" "$f" 2>/dev/null || echo 0)
+              echo "  $f: $n KSU refs"
+            fi
+          done
+
+          echo ""
+          echo "=== fs/namespace.c path_umount check ==="
+          if grep -q "^int path_umount" fs/namespace.c; then
+            echo "  ✅ path_umount injected"
+          else
+            echo "  ⚠️  path_umount NOT FOUND — Kbuild fallback will try"
+          fi
+
+          echo ""
+          echo "=== Defconfig CONFIG_KSU check ==="
+          # Patch should have already added these to lavender_defconfig
+          DCFG_PATH="${DCFG_PATH:-arch/arm64/configs/lavender_defconfig}"
+          grep -E "CONFIG_KSU|CONFIG_KPROBES" "$DCFG_PATH" || echo "  (no KSU/KPROBES lines yet)"
+
+      - name: Inject MINIMAL execveat hook into clean kernel source
+        if: ${{ env.KSU_HOOK_MODE == 'minimal_inject' && inputs.ksun_repo == 'rsuntk/KernelSU' && inputs.hook_strategy == 'minimal' }}
+        working-directory: kernel_source
+        run: |
+          set -e
+          echo "=== Strategy: inject ONLY ksu_handle_execveat hook in fs/exec.c ==="
+          echo "Surface area minimal -> isolated bug surface if bootloop"
+          echo ""
+
+          if [ ! -f fs/exec.c ]; then
+            echo "::error::fs/exec.c not found"; exit 1
+          fi
+          if grep -q "ksu_handle_execveat" fs/exec.c; then
+            echo "  ⚠️  hook already present, skipping"
+            exit 0
+          fi
+
+          # Detect target function name
+          if grep -q "^static int do_execveat_common(int fd, struct filename" fs/exec.c; then
+            TGT="do_execveat_common"
+          elif grep -q "^static int __do_execve_file(int fd, struct filename" fs/exec.c; then
+            TGT="__do_execve_file"
+          else
+            echo "::error::Cannot find execveat function in fs/exec.c"
+            grep -n "^static int.*int fd, struct filename" fs/exec.c | head -5
+            exit 1
+          fi
+          echo "  Target function: ${TGT}"
+
+          # Use awk for reliable multi-line injection (no python heredoc indent issues)
+          cp fs/exec.c fs/exec.c.bak
+          awk -v tgt="$TGT" '
+          BEGIN {
+            inserted_extern = 0
+            after_func_sig = 0
+            inserted_hook = 0
+            in_includes = 1
+            last_include_line = ""
+          }
+          # Track end of #include block: insert extern decls after last #include
+          /^#include/ {
+            if (in_includes) {
+              print
+              last_include_line = NR
+              next
+            }
+          }
+          # First non-include line after include block
+          {
+            if (in_includes && last_include_line != "" && !/^#include/ && !/^[[:space:]]*$/) {
+              # Print extern decls
+              print ""
+              print "// KSU manual hook (minimal injection)"
+              print "extern bool ksu_execveat_hook __read_mostly;"
+              print "extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,"
+              print "                                void *envp, int *flags);"
+              print "extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,"
+              print "                                         void *argv, void *envp, int *flags);"
+              print ""
+              in_includes = 0
+              inserted_extern = 1
+            }
+          }
+          # Detect target function start (multi-line signature)
+          $0 ~ ("^static int " tgt "\\(int fd, struct filename") {
+            print
+            after_func_sig = 1
+            next
+          }
+          # After function signature, find opening brace alone on line
+          after_func_sig && /^\{$/ {
+            print
+            print "\tif (likely(ksu_execveat_hook))"
+            print "\t\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);"
+            print "\telse"
+            print "\t\tksu_handle_execveat_sucompat(&fd, &filename, NULL, NULL, NULL);"
+            after_func_sig = 0
+            inserted_hook = 1
+            next
+          }
+          { print }
+          END {
+            if (!inserted_extern) {
+              print "AWK: extern not inserted (in_includes=" in_includes ", last_inc=" last_include_line ")" > "/dev/stderr"
+              exit 1
+            }
+            if (!inserted_hook) {
+              print "AWK: hook call not inserted" > "/dev/stderr"
+              exit 1
+            }
+          }
+          ' fs/exec.c.bak > fs/exec.c
+
+          if [ $? -ne 0 ]; then
+            echo "::error::awk injection failed; restoring backup"
+            mv fs/exec.c.bak fs/exec.c
+            exit 1
+          fi
+
+          echo ""
+          echo "=== Verification ==="
+          if grep -q "ksu_handle_execveat" fs/exec.c; then
+            echo "  ✅ Hook injection successful"
+            echo ""
+            echo "  --- extern decls ---"
+            grep -n "extern.*ksu_handle_execveat\|extern bool ksu_execveat_hook" fs/exec.c
+            echo ""
+            echo "  --- call site ---"
+            grep -n -B1 -A1 "ksu_handle_execveat(&fd" fs/exec.c | head -10
+          else
+            echo "::error::Hook injection failed (no marker in output)"
+            mv fs/exec.c.bak fs/exec.c
+            exit 1
+          fi
+          rm -f fs/exec.c.bak
+
+      - name: Inject FULL multi-hook (5 hooks compatible with rsuntk modern manager)
+        if: ${{ env.KSU_HOOK_MODE == 'minimal_inject' && inputs.hook_strategy == 'full' }}
+        working-directory: kernel_source
+        run: |
+          set -e
+          echo "=== Strategy: inject FULL hooks for rsuntk modern manager compat ==="
+          echo "Hooks: ksu_handle_execveat, ksu_handle_stat, ksu_handle_faccessat, ksu_handle_vfs_read, ksu_handle_input_handle_event"
+          echo ""
+
+          # ===== HOOK 1: execveat (fs/exec.c) =====
+          if [ ! -f fs/exec.c ]; then
+            echo "::error::fs/exec.c not found"; exit 1
+          fi
+          if grep -q "ksu_handle_execveat" fs/exec.c; then
+            echo "  ⚠️  exec.c hook already present, skipping"
+          else
+            if grep -q "^static int do_execveat_common(int fd, struct filename" fs/exec.c; then
+              TGT="do_execveat_common"
+            elif grep -q "^static int __do_execve_file(int fd, struct filename" fs/exec.c; then
+              TGT="__do_execve_file"
+            else
+              echo "::error::Cannot find execveat function in fs/exec.c"; exit 1
+            fi
+            echo "  [exec.c] target: ${TGT}"
+            cp fs/exec.c fs/exec.c.bak
+            awk -v tgt="$TGT" '
+            BEGIN { in_includes=1; last_include_line=""; after_func_sig=0 }
+            /^#include/ { if (in_includes) { print; last_include_line=NR; next } }
+            { if (in_includes && last_include_line!="" && !/^#include/ && !/^[[:space:]]*$/) {
+                print ""
+                print "// KSU manual hook (full multi-hook injection)"
+                print "extern bool ksu_execveat_hook __read_mostly;"
+                print "extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);"
+                print "extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);"
+                print ""
+                in_includes=0
+            } }
+            $0 ~ ("^static int " tgt "\\(int fd, struct filename") { print; after_func_sig=1; next }
+            after_func_sig && /^\{$/ {
+                print
+                print "\tif (likely(ksu_execveat_hook))"
+                print "\t\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);"
+                print "\telse"
+                print "\t\tksu_handle_execveat_sucompat(&fd, &filename, NULL, NULL, NULL);"
+                after_func_sig=0
+                next
+            }
+            { print }
+            ' fs/exec.c.bak > fs/exec.c
+            grep -q "ksu_handle_execveat" fs/exec.c || { mv fs/exec.c.bak fs/exec.c; echo "::error::exec.c injection failed"; exit 1; }
+            rm -f fs/exec.c.bak
+            echo "  ✅ fs/exec.c patched"
+          fi
+
+          # ===== HOOK 2: stat (fs/stat.c) - for vfs_statx callsite =====
+          if [ -f fs/stat.c ] && ! grep -q "ksu_handle_stat" fs/stat.c; then
+            echo "  [stat.c] injecting hook..."
+            cp fs/stat.c fs/stat.c.bak
+            # Find vfs_statx() function and inject hook at top
+            awk '
+            BEGIN { in_includes=1; last_include_line=""; injected_extern=0; injected_hook=0 }
+            /^#include/ { if (in_includes) { print; last_include_line=NR; next } }
+            { if (in_includes && last_include_line!="" && !/^#include/ && !/^[[:space:]]*$/) {
+                print ""
+                print "// KSU manual hook"
+                print "extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);"
+                print ""
+                in_includes=0
+                injected_extern=1
+            } }
+            # Match start of vfs_fstatat/vfs_statx function
+            /^int vfs_fstatat\(int dfd, const char __user \*filename/ ||
+            /^static int vfs_statx\(int dfd, const char __user \*filename/ ||
+            /^SYSCALL_DEFINE4\(newfstatat,/ {
+                print
+                in_target_func=1
+                next
+            }
+            in_target_func && /^\{$/ {
+                print
+                print "\tksu_handle_stat(&dfd, &filename, &flag);"
+                in_target_func=0
+                injected_hook=1
+                next
+            }
+            { print }
+            END {
+                if (!injected_extern) print "  WARN: stat.c extern not injected" > "/dev/stderr"
+                if (!injected_hook) print "  WARN: stat.c hook call not injected (function pattern not matched)" > "/dev/stderr"
+            }
+            ' fs/stat.c.bak > fs/stat.c
+            if grep -q "ksu_handle_stat" fs/stat.c; then
+              echo "  ✅ fs/stat.c patched"
+            else
+              echo "  ⚠️  fs/stat.c hook injection had warnings, restoring backup"
+              mv fs/stat.c.bak fs/stat.c
+            fi
+            rm -f fs/stat.c.bak
+          fi
+
+          # ===== HOOK 3: faccessat (fs/open.c) =====
+          if [ -f fs/open.c ] && ! grep -q "ksu_handle_faccessat" fs/open.c; then
+            echo "  [open.c] injecting faccessat hook..."
+            cp fs/open.c fs/open.c.bak
+            awk '
+            BEGIN { in_includes=1; last_include_line="" }
+            /^#include/ { if (in_includes) { print; last_include_line=NR; next } }
+            { if (in_includes && last_include_line!="" && !/^#include/ && !/^[[:space:]]*$/) {
+                print ""
+                print "// KSU manual hook"
+                print "extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);"
+                print ""
+                in_includes=0
+            } }
+            /^SYSCALL_DEFINE3\(faccessat,/ ||
+            /^long do_faccessat\(int dfd, const char __user \*filename/ {
+                print
+                in_target_func=1
+                next
+            }
+            in_target_func && /^\{$/ {
+                print
+                print "\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);"
+                in_target_func=0
+                next
+            }
+            { print }
+            ' fs/open.c.bak > fs/open.c
+            if grep -q "ksu_handle_faccessat" fs/open.c; then
+              echo "  ✅ fs/open.c patched"
+            else
+              echo "  ⚠️  fs/open.c skipped (pattern no match)"
+              mv fs/open.c.bak fs/open.c
+            fi
+            rm -f fs/open.c.bak
+          fi
+
+          # ===== HOOK 4: sys_reboot (kernel/reboot.c) - REQUIRED by KSUN-Next legacy Kbuild check =====
+          if [ -f kernel/reboot.c ] && ! grep -q "ksu_handle_sys_reboot" kernel/reboot.c; then
+            echo "  [reboot.c] injecting sys_reboot hook (KSUN-Next requirement)..."
+            cp kernel/reboot.c kernel/reboot.c.bak
+            awk '
+            BEGIN { in_includes=1; last_include_line="" }
+            /^#include/ { if (in_includes) { print; last_include_line=NR; next } }
+            { if (in_includes && last_include_line!="" && !/^#include/ && !/^[[:space:]]*$/) {
+                print ""
+                print "// KSU manual hook"
+                print "extern int ksu_handle_sys_reboot(int *magic1, int *magic2, unsigned int *cmd, void __user **arg);"
+                print ""
+                in_includes=0
+            } }
+            /^SYSCALL_DEFINE4\(reboot,/ {
+                print
+                in_target_func=1
+                next
+            }
+            in_target_func && /^\{$/ {
+                print
+                print "\tksu_handle_sys_reboot(&magic1, &magic2, &cmd, &arg);"
+                in_target_func=0
+                next
+            }
+            { print }
+            ' kernel/reboot.c.bak > kernel/reboot.c
+            if grep -q "ksu_handle_sys_reboot" kernel/reboot.c; then
+              echo "  ✅ kernel/reboot.c patched"
+            else
+              echo "  ⚠️  kernel/reboot.c hook injection failed (pattern no match)"
+              mv kernel/reboot.c.bak kernel/reboot.c
+            fi
+            rm -f kernel/reboot.c.bak
+          fi
+
+          # ===== KSU_NEXT BACKPORT: path_umount (KSUN-Next requires this for 4.4) =====
+          # Kbuild auto-patch fails on 4.4 because pattern `^static bool is_mnt_ns_file` not matched.
+          # We manually inject path_umount + can_umount via printf (avoid YAML heredoc issue).
+          if [ -f fs/namespace.c ] && ! grep -q "^int path_umount" fs/namespace.c; then
+            echo "  [namespace.c] injecting path_umount/can_umount backport..."
+            {
+              printf '\n'
+              printf '/* KSU_NEXT: backport for path_umount (required by KSUN-Next driver) */\n'
+              printf 'static int can_umount_ksu(const struct path *path, int flags)\n'
+              printf '{\n'
+              printf '\tstruct mount *mnt = real_mount(path->mnt);\n'
+              printf '\tif (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))\n'
+              printf '\t\treturn -EINVAL;\n'
+              printf '\tif (!may_mount())\n'
+              printf '\t\treturn -EPERM;\n'
+              printf '\tif (path->dentry != path->mnt->mnt_root)\n'
+              printf '\t\treturn -EINVAL;\n'
+              printf '\tif (!check_mnt(mnt))\n'
+              printf '\t\treturn -EINVAL;\n'
+              printf '\tif (mnt->mnt.mnt_flags & MNT_LOCKED)\n'
+              printf '\t\treturn -EINVAL;\n'
+              printf '\tif (flags & MNT_FORCE && !capable(CAP_SYS_ADMIN))\n'
+              printf '\t\treturn -EPERM;\n'
+              printf '\treturn 0;\n'
+              printf '}\n'
+              printf '\n'
+              printf 'int path_umount(struct path *path, int flags)\n'
+              printf '{\n'
+              printf '\tstruct mount *mnt = real_mount(path->mnt);\n'
+              printf '\tint ret;\n'
+              printf '\tret = can_umount_ksu(path, flags);\n'
+              printf '\tif (!ret)\n'
+              printf '\t\tret = do_umount(mnt, flags);\n'
+              printf '\tdput(path->dentry);\n'
+              printf '\tmntput_no_expire(mnt);\n'
+              printf '\treturn ret;\n'
+              printf '}\n'
+            } >> fs/namespace.c
+            # Add forward declaration to fs/internal.h
+            if [ -f fs/internal.h ] && ! grep -q "int path_umount" fs/internal.h; then
+              printf '\n/* KSU_NEXT: forward decl */\nint path_umount(struct path *path, int flags);\n' >> fs/internal.h
+              echo "  ✅ fs/internal.h forward decl added"
+            fi
+            echo "  ✅ fs/namespace.c path_umount backport injected"
+          fi
+
+          # ===== Verification =====
+          echo ""
+          echo "=== Verification ==="
+          for f in fs/exec.c fs/stat.c fs/open.c kernel/reboot.c; do
+            if [ -f "$f" ]; then
+              n=$(grep -c "ksu_handle_" "$f" || echo 0)
+              echo "  $f: $n ksu_handle_ refs"
+            fi
+          done
+
+      - name: Clone SUSFS
+        if: ${{ inputs.enable_susfs == 'true' && inputs.pre_patched_kernel != 'true' }}
+        run: |
+          git clone --depth=1 -b "${{ inputs.susfs_branch }}" \
+            https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
+          cd susfs4ksu
+          echo "SUSFS_VERSION=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      - name: Apply SUSFS patches
+        if: ${{ inputs.enable_susfs == 'true' && inputs.pre_patched_kernel != 'true' }}
+        run: |
+          set -e
+          cd kernel_source
+
+          # 1) Copy SUSFS kernel sources into kernel tree
+          cp ../susfs4ksu/kernel_patches/fs/* fs/ 2>/dev/null || true
+          cp ../susfs4ksu/kernel_patches/include/linux/* include/linux/ 2>/dev/null || true
+
+          # 2) Apply kernel-side patch
+          KPATCH=$(ls ../susfs4ksu/kernel_patches/50_add_susfs_in_kernel-*.patch 2>/dev/null | head -n1)
+          if [ -n "$KPATCH" ]; then
+            echo "Applying kernel patch: $KPATCH"
+            patch -p1 --forward --fuzz=3 < "$KPATCH" || \
+              echo "::warning::Kernel SUSFS patch had rejects. Continuing - check *.rej files."
+          fi
+
+          # 3) Apply KSU-Next side patch
+          if [ -d KernelSU-Next ]; then
+            cd KernelSU-Next
+            KSU_PATCH=$(ls ../../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch 2>/dev/null || true)
+            if [ -n "$KSU_PATCH" ]; then
+              echo "Applying KSU-Next SUSFS patch: $KSU_PATCH"
+              patch -p1 --forward --fuzz=3 < "$KSU_PATCH" || \
+                echo "::warning::KSU-Next SUSFS patch had rejects."
+            fi
+            cd ..
+          fi
+
+      - name: Inject defconfig flags
+        working-directory: kernel_source
+        run: |
+          # Strip existing localversion-* files (st74, san, halfelf, etc) to prevent
+          # them appending to our CONFIG_LOCALVERSION
+          echo "=== Strip pre-existing localversion files ==="
+          ls -la localversion* 2>/dev/null || echo "  (none)"
+          rm -f localversion-*
+          echo "  After cleanup:"
+          ls -la localversion* 2>/dev/null || echo "  (clean)"
+          echo ""
+
+          {
+            echo ""
+            echo "# === KernelSU ==="
+            echo "CONFIG_KSU=y"
+            echo "CONFIG_KSU_DEBUG=n"
+            echo "CONFIG_OVERLAY_FS=y"
+            echo ""
+            echo "# === Custom kernel branding ==="
+            echo "CONFIG_LOCALVERSION=\"-C9-${{ inputs.kernel_codename }}-KSUN-${{ inputs.kernel_relver }}\""
+            echo "# CONFIG_LOCALVERSION_AUTO is not set"
+          } >> "${DCFG_PATH}"
+
+          if [ "${KSU_HOOK_MODE}" = "auto" ]; then
+            echo "rsuntk/KernelSU - no hook config needed (auto-detected at compile time)"
+          elif [ "${KSU_HOOK_MODE}" = "kprobes" ]; then
+            {
+              echo "CONFIG_KPROBES=y"
+              echo "CONFIG_KRETPROBES=y"
+              echo "CONFIG_HAVE_KPROBES=y"
+              echo "CONFIG_HAVE_KRETPROBES=y"
+              echo "CONFIG_HAVE_SYSCALL_TRACEPOINTS=y"
+              echo "CONFIG_KSU_KPROBES_HOOK=y"
+            } >> "${DCFG_PATH}"
+            echo "Using KPROBES hooks"
+          else
+            echo "CONFIG_KSU_MANUAL_HOOK=y" >> "${DCFG_PATH}"
+            echo "Using MANUAL hooks (mode: ${KSU_HOOK_MODE})"
+          fi
+
+          if [ "${{ inputs.enable_susfs }}" = "true" ]; then
+            {
+              echo ""
+              echo "# === SUSFS ==="
+              echo "CONFIG_KSU_SUSFS=y"
+              echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y"
+              echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
+              echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
+              echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y"
+              echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y"
+              echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
+              echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"
+              echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y"
+              echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
+              echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
+              echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
+              echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
+              echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
+              # CONFIG_KSU_SUSFS_SUS_SU intentionally disabled (unstable on 4.4)
+            } >> "${DCFG_PATH}"
+          fi
+
+      - name: Force KSU_VERSION via Kbuild override (fix version=0 bug)
+        if: ${{ contains(inputs.ksun_repo, 'KernelSU-Next') && inputs.ksun_branch != 'next' && inputs.pre_patched_kernel != 'true' }}
+        working-directory: kernel_source
+        run: |
+          set -e
+          # Setup script clone KSU but doesn't preserve .git context properly.
+          # Kbuild fallback: KSU_VERSION_FALLBACK := 1, but actual driver returns 0.
+          # We force it by appending ccflags directly to KernelSU-Next/Kbuild.
+          
+          KBUILD_FILE="${KSU_DIR}/kernel/Kbuild"
+          if [ ! -f "$KBUILD_FILE" ]; then
+            echo "::warning::$KBUILD_FILE not found, trying alternative path"
+            KBUILD_FILE="${KSU_DIR}/Kbuild"
+          fi
+          
+          if [ -f "$KBUILD_FILE" ]; then
+            # Read the actual git tag/commit count from KSU repo
+            cd "${KSU_DIR}"
+            KSU_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v3.2.0-legacy")
+            KSU_COMMIT_COUNT=$(git rev-list --count HEAD 2>/dev/null || echo "1000")
+            cd ..
+
+            # NOTE: Manager v3.2.0-spoofed bundles ksud version 33129.
+            # We MUST match this to make Shamiko (and other strict modules) accept.
+            # If kernel KSU_VERSION != ksud version, Shamiko aborts with
+            # "KernelSU version abnormal".
+            FORCED_VERSION=33129
+
+            echo "  Forcing KSU_VERSION=$FORCED_VERSION (tag=$KSU_TAG)"
+            echo "  Appending overrides to $KBUILD_FILE"
+            
+            # Append at the end of Kbuild to override fallback
+            {
+              echo ""
+              echo "# === Workflow forced override (fix git context loss) ==="
+              echo "ccflags-y += -UKSU_VERSION"
+              echo "ccflags-y += -DKSU_VERSION=$FORCED_VERSION"
+              echo "ccflags-y += -UKSU_VERSION_TAG"
+              echo "ccflags-y += -DKSU_VERSION_TAG=\\\"$KSU_TAG\\\""
+            } >> "$KBUILD_FILE"
+            
+            echo "  ✅ KSU_VERSION forced to $FORCED_VERSION"
+            echo "FORCED_KSU_VERSION=$FORCED_VERSION" >> $GITHUB_ENV
+            
+            # ===== ALSO patch supercall.c: ksuver_override default =====
+            # Driver has `uint32_t ksuver_override = 0;` global.
+            # Zygisk loaders read this var via supercall protocol.
+            # Force default value to FORCED_VERSION instead of 0.
+            SUPERCALL_FILE="${KSU_DIR}/kernel/supercall/supercall.c"
+            if [ -f "$SUPERCALL_FILE" ]; then
+              if grep -q "uint32_t ksuver_override = 0;" "$SUPERCALL_FILE"; then
+                sed -i "s|uint32_t ksuver_override = 0;|uint32_t ksuver_override = $FORCED_VERSION;|" "$SUPERCALL_FILE"
+                echo "  ✅ ksuver_override default patched in supercall.c"
+                grep "uint32_t ksuver_override" "$SUPERCALL_FILE"
+              else
+                echo "  ⚠️  ksuver_override pattern not found in supercall.c"
+                grep -n "ksuver_override" "$SUPERCALL_FILE" | head -5
+              fi
+            else
+              echo "  ⚠️  supercall.c not found, skipping ksuver_override patch"
+            fi
+          fi
+
+      - name: Force KSU_VERSION on pre-patched source (match manager 33129)
+        if: ${{ inputs.pre_patched_kernel == 'true' && inputs.force_ksu_version != '' }}
+        working-directory: kernel_source
+        run: |
+          set -e
+          FV="${{ inputs.force_ksu_version }}"
+          echo "=== Forcing KSU_VERSION=$FV on pre-integrated KSU source ==="
+          # Find the KSU kernel Makefile/Kbuild that defines KSU_VERSION via ccflags.
+          # In kucingoranye pre-integrated source, KSU lives under drivers/kernelsu or KernelSU*.
+          CAND=$(grep -rl -E "KSU_VERSION" --include=Makefile --include=Kbuild drivers KernelSU* 2>/dev/null | head -5 || true)
+          echo "Candidate makefiles:"; echo "$CAND"
+          PATCHED=0
+          for f in $CAND; do
+            # Append override at end of the makefile
+            {
+              echo ""
+              echo "# === Workflow forced KSU version override ==="
+              echo "ccflags-y += -UKSU_VERSION -DKSU_VERSION=$FV"
+            } >> "$f"
+            echo "  appended override to $f"
+            PATCHED=1
+          done
+          # Also patch any hardcoded version define in headers/c (e.g. #define KSU_VERSION 33091)
+          HC=$(grep -rl -E "define[[:space:]]+KSU_VERSION[[:space:]]+[0-9]+" drivers KernelSU* 2>/dev/null || true)
+          for f in $HC; do
+            sed -i -E "s/(define[[:space:]]+KSU_VERSION[[:space:]]+)[0-9]+/\1$FV/" "$f"
+            echo "  patched #define in $f"
+            PATCHED=1
+          done
+          # Patch ksuver_override default if present
+          SC=$(grep -rl "uint32_t ksuver_override = 0;" drivers KernelSU* 2>/dev/null || true)
+          for f in $SC; do
+            sed -i "s/uint32_t ksuver_override = 0;/uint32_t ksuver_override = $FV;/" "$f"
+            echo "  patched ksuver_override in $f"
+            PATCHED=1
+          done
+          if [ "$PATCHED" = "0" ]; then
+            echo "::warning::Could not locate KSU_VERSION definition; manager warning may persist"
+          else
+            echo "  ✅ KSU_VERSION override applied ($FV)"
+          fi
+
+      - name: Patch lavender DTS fstab (non-dynamic / legacy partition)
+        if: ${{ inputs.legacy_fstab == 'true' }}
+        working-directory: kernel_source
+        run: |
+          set -e
+          echo "=== Patching lavender DTS for NON-DYNAMIC (legacy) fstab ==="
+          DTSI="arch/arm64/boot/dts/vendor/qcom/xiaomi/longcheer/lavender/lavender-base.dtsi"
+          if [ ! -f "$DTSI" ]; then
+            echo "::warning::lavender-base.dtsi not at expected path, searching..."
+            DTSI=$(find arch/arm64/boot/dts -name "lavender-base.dtsi" 2>/dev/null | head -1)
+            [ -z "$DTSI" ] && { echo "::error::lavender-base.dtsi not found"; exit 1; }
+          fi
+          echo "Found DTSI: $DTSI"
+          python3 "$GITHUB_WORKSPACE/builder/assets/fstab_patch.py" "$DTSI"
+          echo ""
+          echo "=== After patch (fstab section) ==="
+          grep -n -A20 "fstab {" "$DTSI" | head -30 || true
+
+      - name: Build kernel
+        working-directory: kernel_source
+        env:
+          ARCH: arm64
+          SUBARCH: arm64
+          KBUILD_BUILD_USER: JorianPonomaref
+          KBUILD_BUILD_HOST: lavender-actions
+        run: |
+          set -eo pipefail
+          export PATH="$GITHUB_WORKSPACE/toolchain/clang/bin:$PATH"
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+
+          echo "=== Toolchain check ==="
+          which clang || { echo "::error::clang not found in PATH"; exit 1; }
+          clang --version
+          aarch64-linux-gnu-ld --version | head -n1
+          aarch64-linux-gnu-gcc --version | head -n1
+          echo ""
+
+          MAKE_DCFG=$(basename "${DCFG_NAME}")
+          # If defconfig is in vendor/ subfolder, kbuild won't find it directly
+          # Copy it to root arch/arm64/configs/ so make can use it
+          if echo "${DCFG_NAME}" | grep -q '^vendor/'; then
+            echo "=== Defconfig in vendor/ subfolder, copy to root for make ==="
+            cp "arch/arm64/configs/${DCFG_NAME}" "arch/arm64/configs/${MAKE_DCFG}"
+            echo "  Copied: arch/arm64/configs/${DCFG_NAME} -> arch/arm64/configs/${MAKE_DCFG}"
+          fi
+          echo "=== Generating .config from ${MAKE_DCFG} ==="
+          make O=out ARCH=arm64 "${MAKE_DCFG}" 2>&1 | tee -a build.log
+
+          echo ""
+          echo "=== Building kernel (Clang+GNU-LD hybrid for 4.4 compat) ==="
+          echo "KernelSU repo: ${{ inputs.ksun_repo }}"
+          echo "Hook mode: ${KSU_HOOK_MODE}"
+
+          # NOTE: Kernel 4.4 doesn't play nice with ld.lld (empty built-in.o issue).
+          # Use Clang for compile but GNU ld (from binutils) for link.
+          # Exception: Full LTO requires ld.lld (GNU ld can't handle LTO bitcode).
+
+          # === LTO + Polly flags ===
+          EXTRA_KCFLAGS=""
+          LINKER_OVERRIDE=""
+          LTO_MODE="${{ inputs.enable_lto }}"
+          POLLY_ENABLED="${{ inputs.enable_polly }}"
+
+          # Use LLD (LLVM linker) for kernels that need it (4.19+ kucingoranye style)
+          if [ "${{ inputs.use_llvm_linker }}" = "true" ]; then
+            echo "🔗 Using LLD (LLVM linker) instead of GNU ld"
+            LINKER_OVERRIDE="LD=ld.lld LLVM=1 LLVM_IAS=1"
+          fi
+
+          if [ "$LTO_MODE" = "thin" ]; then
+            echo "⚡ ThinLTO enabled"
+            echo "⚠️  NOTE: Kernel 4.4 requires Makefile backport for LTO. If build fails, use 'off'."
+            EXTRA_KCFLAGS="$EXTRA_KCFLAGS -flto=thin -fvisibility=hidden"
+            LINKER_OVERRIDE="LD=ld.lld LLVM=1 LLVM_IAS=1"
+          elif [ "$LTO_MODE" = "full" ]; then
+            echo "⚡ Full LTO enabled (slow build, max optimize)"
+            echo "⚠️  NOTE: Kernel 4.4 requires Makefile backport for LTO. If build fails, use 'off'."
+            EXTRA_KCFLAGS="$EXTRA_KCFLAGS -flto -fvisibility=hidden"
+            LINKER_OVERRIDE="LD=ld.lld LLVM=1 LLVM_IAS=1"
+          fi
+
+          if [ "$POLLY_ENABLED" = "true" ]; then
+            echo "⚡ LLVM Polly optimizer enabled"
+            EXTRA_KCFLAGS="$EXTRA_KCFLAGS -mllvm -polly -mllvm -polly-vectorizer=stripmine -mllvm -polly-run-dce"
+          fi
+
+          if [ -n "$EXTRA_KCFLAGS" ]; then
+            echo "  KCFLAGS: $EXTRA_KCFLAGS"
+          fi
+
+          # For LTO builds: need to disable host tool compilation with LTO flags
+          # by building scripts separately without KCFLAGS
+          if [ "$LTO_MODE" != "off" ] && [ -n "$LTO_MODE" ]; then
+            echo "=== Pre-build: compile scripts without LTO ==="
+            make O=out ARCH=arm64 \
+              CC="ccache clang" \
+              CLANG_TRIPLE=aarch64-linux-gnu- \
+              CROSS_COMPILE=aarch64-linux-gnu- \
+              CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+              scripts 2>&1 | tee -a build.log
+            echo "=== Scripts built, now building kernel with LTO ==="
+          fi
+
+          make O=out ARCH=arm64 \
+            CC="ccache clang" \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            ${LINKER_OVERRIDE} \
+            ${EXTRA_KCFLAGS:+KCFLAGS="$EXTRA_KCFLAGS"} \
+            -j$(nproc --all) 2>&1 | tee -a build.log
+
+          echo ""
+          echo "=== Build outputs ==="
+          ls -lah out/arch/arm64/boot/ || true
+
+      - name: Verify build artifacts
+        working-directory: kernel_source
+        run: |
+          IMAGE=""
+          for cand in \
+              out/arch/arm64/boot/Image.gz-dtb \
+              out/arch/arm64/boot/Image-dtb \
+              out/arch/arm64/boot/Image.gz \
+              out/arch/arm64/boot/Image; do
+            if [ -f "$cand" ]; then IMAGE="$cand"; break; fi
+          done
+          if [ -z "$IMAGE" ]; then
+            echo "::error::No kernel image produced!"
+            ls -lah out/arch/arm64/boot/ || true
+            exit 1
+          fi
+          echo "KERNEL_IMAGE=$IMAGE" >> $GITHUB_ENV
+          ls -lah out/arch/arm64/boot/
+
+      - name: Patch stock DTB (disable forced encryption)
+        if: ${{ inputs.use_stock_dtb == 'true' && inputs.patch_dtb_encrypt == 'true' }}
+        run: |
+          set -e
+          SRC="builder/assets/stock-dtb/kernel_dtb"
+          if [ ! -f "$SRC" ]; then
+            echo "::warning::stock dtb not found, skipping encrypt patch"; exit 0
+          fi
+          echo "=== Binary-safe DTB encryption patch (preserves backlight/panel props) ==="
+          echo "  md5 before: $(md5sum "$SRC" | awk '{print $1}')"
+          python3 builder/assets/patch_dtb_encrypt.py "$SRC"
+          echo "  md5 after:  $(md5sum "$SRC" | awk '{print $1}')"
+          echo "  verify no forceencrypt left:"
+          if grep -a -c "forceencrypt" "$SRC" >/dev/null 2>&1 && [ "$(grep -a -c forceencrypt "$SRC")" != "0" ]; then
+            echo "  ::warning:: forceencrypt still present"
+          else
+            echo "  ✅ forceencrypt removed"
+          fi
+
+      - name: Patch stock DTB (fix backlight WLED driver match)
+        if: ${{ inputs.use_stock_dtb == 'true' && inputs.patch_dtb_wled == 'true' }}
+        run: |
+          set -e
+          SRC="builder/assets/stock-dtb/kernel_dtb"
+          if [ ! -f "$SRC" ]; then
+            echo "::warning::stock dtb not found, skipping wled patch"; exit 0
+          fi
+          echo "=== Install python fdt (DTB parser) ==="
+          python3 -m pip install --quiet fdt || pip3 install --quiet fdt
+          echo "=== WLED node retarget: qcom,qpnp-wled -> qcom,pm660l-spmi-wled ==="
+          echo "  md5 before: $(md5sum "$SRC" | awk '{print $1}')"
+          python3 builder/assets/patch_dtb_wled.py "$SRC"
+          echo "  md5 after:  $(md5sum "$SRC" | awk '{print $1}')"
+          echo "  verify no qcom,qpnp-wled left:"
+          if grep -a -c "qcom,qpnp-wled" "$SRC" >/dev/null 2>&1 && [ "$(grep -a -c 'qcom,qpnp-wled' "$SRC")" != "0" ]; then
+            echo "  ::warning:: qcom,qpnp-wled still present"
+          else
+            echo "  ✅ qcom,qpnp-wled retargeted (backlight should bind to mainline WLED driver)"
+          fi
+          echo "  bl_ctrl_wled string count (should stay >0): $(grep -a -c 'bl_ctrl_wled' "$SRC" || echo 0)"
+
+      - name: Package with AnyKernel3
+        run: |
+          set -e
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+          cp builder/assets/anykernel.sh AnyKernel3/anykernel.sh
+
+          # === Optionally stitch STOCK S0NiX DTB (only for foreign-lineage source).
+          #     For ImSpiDy/S0NiX source the native dtb already matches ROM. ===
+          STOCK_DTB="builder/assets/stock-dtb/kernel_dtb"
+          BOOTDIR="kernel_source/out/arch/arm64/boot"
+          if [ "${{ inputs.use_stock_dtb }}" = "true" ] && [ -f "$STOCK_DTB" ]; then
+            echo "=== Stock DTB found, repacking Image.gz-dtb with stock dtb ==="
+            # Find the raw compressed kernel image (without dtb)
+            RAWIMG=""
+            for c in "$BOOTDIR/Image.gz" "$BOOTDIR/Image"; do
+              [ -f "$c" ] && RAWIMG="$c" && break
+            done
+            if [ -z "$RAWIMG" ]; then
+              echo "::warning::No raw Image.gz/Image found; will strip dtb from ${KERNEL_IMAGE}"
+              # Fallback: dtb magic is d00dfeed; we cannot easily split, so just use stock dtb appended to whatever Image.gz-dtb minus trailing dtb is risky.
+              # Safer: use the build Image.gz-dtb as-is only if no raw image. But we prefer raw.
+              RAWIMG="kernel_source/${KERNEL_IMAGE}"
+            fi
+            echo "  Raw kernel image: $RAWIMG"
+            cat "$RAWIMG" "$STOCK_DTB" > AnyKernel3/Image.gz-dtb
+            echo "  Built Image.gz-dtb (kernel + stock dtb): $(ls -lah AnyKernel3/Image.gz-dtb | awk '{print $5}')"
+            echo "STitched stock dtb into Image.gz-dtb"
+          else
+            echo "::warning::Stock DTB not found at $STOCK_DTB, using build output as-is"
+            cp "kernel_source/${KERNEL_IMAGE}" AnyKernel3/
+          fi
+
+          # Copy DTBs if present (dtbo only; main dtb handled above)
+          for f in kernel_source/out/arch/arm64/boot/dtbo.img; do
+            [ -f "$f" ] && cp "$f" AnyKernel3/ || true
+          done
+
+          # San-Kernel style naming: C9-Kernel-<Codename>-R<Ver>-<Device>-KSUN.zip
+          # Example: C9-Kernel-Phoenix-R1.0-Lavender-KSUN.zip
+          DEVICE_CODENAME=$(basename "${DCFG_NAME}" | sed 's|_defconfig$||; s|-perf_defconfig$||; s|-perf$||')
+          echo "DEVICE_CODENAME=${DEVICE_CODENAME}" >> $GITHUB_ENV
+          # Capitalize first letter for device label (lavender -> Lavender)
+          DEVICE_LABEL=$(echo "${DEVICE_CODENAME}" | awk '{print toupper(substr($0,1,1)) substr($0,2)}')
+          KERNEL_CODENAME="${{ inputs.kernel_codename }}"
+          KERNEL_RELVER="${{ inputs.kernel_relver }}"
+          KERNEL_CODENAME="${KERNEL_CODENAME:-Phoenix}"
+          KERNEL_RELVER="${KERNEL_RELVER:-R1.0}"
+          ZIPNAME="C9-Kernel-${KERNEL_CODENAME}-${KERNEL_RELVER}-${DEVICE_LABEL}-KSUN"
+          if [ "${{ inputs.ksun_branch }}" = "next" ] || [ "${{ inputs.ksun_branch }}" = "dev" ]; then
+            ZIPNAME="${ZIPNAME}-Next"
+          elif [ "${{ inputs.ksun_branch }}" = "legacy-susfs" ]; then
+            ZIPNAME="${ZIPNAME}-LegacySusfs"
+          fi
+          if [ "${{ inputs.enable_susfs }}" = "true" ]; then
+            ZIPNAME="${ZIPNAME}-SUSFS"
+          fi
+          if [ "${{ inputs.enable_lto }}" = "thin" ]; then
+            ZIPNAME="${ZIPNAME}-ThinLTO"
+          elif [ "${{ inputs.enable_lto }}" = "full" ]; then
+            ZIPNAME="${ZIPNAME}-FullLTO"
+          fi
+          if [ "${{ inputs.enable_polly }}" = "true" ]; then
+            ZIPNAME="${ZIPNAME}-Polly"
+          fi
+          ZIPNAME="${ZIPNAME}.zip"
+          echo "KERNEL_CODENAME=${KERNEL_CODENAME}" >> $GITHUB_ENV
+          echo "KERNEL_RELVER=${KERNEL_RELVER}" >> $GITHUB_ENV
+          echo "DEVICE_LABEL=${DEVICE_LABEL}" >> $GITHUB_ENV
+          echo "Output zip: ${ZIPNAME}"
+
+          cd AnyKernel3
+          zip -r9 "../${ZIPNAME}" . -x ".git*" -x "README.md"
+          cd ..
+          echo "OUTZIP=${ZIPNAME}" >> $GITHUB_ENV
+          ls -lah "${ZIPNAME}"
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: C9-Kernel-${{ env.DEVICE_CODENAME || 'unknown' }}-KSUN-${{ github.run_number }}
+          path: |
+            ${{ env.OUTZIP }}
+            kernel_source/build.log
+            kernel_source/**/*.rej
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Create Release (cross-repo to C9-Kernel_releases)
+        if: success() && env.OUTZIP != '' && inputs.enable_lto == 'off' && inputs.enable_polly == 'false' && inputs.ksun_branch != 'next' && !contains(inputs.kernel_relver, 'Test')
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.RELEASES_TOKEN }}
+          tag_name: ${{ env.KERNEL_CODENAME }}-${{ env.KERNEL_RELVER }}-${{ env.DEVICE_CODENAME }}
+          name: C9-Kernel-${{ env.KERNEL_CODENAME }}-${{ env.KERNEL_RELVER }}-${{ env.DEVICE_LABEL }}-4.19
+          repository: rianrizkifauzi/C9-Kernel_releases
+          body: |
+            C9-Kernel-linux version-4.4
+            Codename: ${{ env.KERNEL_CODENAME }}
+            Type: Stable
+
+            Changelog ${{ env.KERNEL_RELVER }} :
+
+            _• Compiled using Neutron Clang (LLD) matching S0NiX stock build env._
+            _• Bump to Linux ${{ env.KERNEL_VERSION }} (CIP-LTS)._
+            _• Base on `${{ inputs.kernel_repo }}@${{ inputs.kernel_branch }}` (`${{ env.KERNEL_SHA }}`)._
+            _• Integrate KernelSU-Next (`${{ inputs.ksun_branch }}` @ `${{ env.KSUN_VERSION }}`, forced KSU_VERSION 33129)._
+            _• Apply manual hooks from kucingoranye/kernel_patches (execveat, stat, faccessat, vfs_read, sys_reboot, selinux NNP bypass)._
+            _• Backport `path_umount` from kernel 5.10.9 by backslashxx (KSUN driver requirement)._
+            _• AnyKernel3 flashable zip with C9 banner._
+            _• Build identity: JorianPonomaref@lavender-actions._
+            _• SUSFS: ${{ inputs.enable_susfs == 'true' && 'enabled' || 'disabled' }}._
+
+            Tested on:
+            _• Xiaomi Redmi Note 7 (Lavender / SDM660)._
+            _• Android 11 / crDroid 7.x base ROM._
+            _• KernelSU-Next Manager v3.2.0-spoofed (33129) → Working._
+            _• Zygisk Next 1.3.4-746 → daemon running, both zygote injected._
+
+            Full changelog : [CHANGELOG.md](https://github.com/rianrizkifauzi/C9-Kernel_xiaomi_lavender_419/blob/main/CHANGELOG.md)
+            Build pipeline : [Run #${{ github.run_number }}](https://github.com/rianrizkifauzi/C9-Kernel_xiaomi_lavender_419/actions/runs/${{ github.run_id }})
+
+            Flash via TWRP / OFOX. Backup boot partition before flashing.
+          files: ${{ env.OUTZIP }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASES_TOKEN }}

@@ -1,0 +1,40 @@
+out/
+build/
+*.zip
+*.img
+*.gz
+toolchain/
+AnyKernel3/
+kernel_source/
+KernelSU-Next/
+susfs4ksu/
+.vscode/
+
+# Local helper scripts & diagnostic dumps (do not commit to public repo)
+.gh-token.txt
+*.bat
+*.ps1
+*.sh
+*.out
+*.log
+*.json
+*.txt
+*.apk
+*.md.bak
+
+# Allow the documentation MDs we DO want to commit
+!README.md
+!CHANGELOG.md
+!PAT-SETUP.md
+
+# Allow workflow YAML and assets
+!.github/**
+!assets/**
+!releases-init/**
+
+# Diagnostic dump folders
+crash-logs/
+ksu-logs/
+ksu-logs2/
+run*-logs/
+zygisk-extract/
