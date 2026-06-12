@@ -50,7 +50,7 @@ on:
         required: true
         default: 'none'
         type: choice
-        options: ['kucingoranye_patch', 'minimal', 'full', 'none']
+        options: ['kucingoranye_patch', 'minimal', 'full', 'none', 'kprobes']
       pre_patched_kernel:
         description: 'Skip cloning KernelSU + skip applying patches if true. FALSE for Bouquet source (clean, needs KSU clone + hook inject).'
         required: false
@@ -321,8 +321,14 @@ jobs:
         working-directory: kernel_source
         run: |
           set -e
+          # Honor explicit kprobes strategy: KSU-Next uses kprobe-based hooking
+          # (no manual source inject needed). More reliable for grant-root path
+          # than partial manual hooks. Requires CONFIG_KPROBES=y (bouquet has it).
+          if [ "${{ inputs.hook_strategy }}" = "kprobes" ]; then
+            echo "⚙️  Forced KPROBES hook mode (no manual inject)"
+            echo "KSU_HOOK_MODE=kprobes" >> $GITHUB_ENV
           # Check if kernel source already has KSU manual hook calls (e.g. ksu-patches branch)
-          if grep -rq "ksu_handle_execveat\|ksu_handle_faccessat\|ksu_handle_stat" fs/ 2>/dev/null; then
+          elif grep -rq "ksu_handle_execveat\|ksu_handle_faccessat\|ksu_handle_stat" fs/ 2>/dev/null; then
             echo "✅ Manual KSU hooks already exist in kernel source"
             echo "KSU_HOOK_MODE=manual_existing" >> $GITHUB_ENV
           else
